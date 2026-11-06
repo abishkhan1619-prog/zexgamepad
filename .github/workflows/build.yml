@@ -1,0 +1,383 @@
+name: Build ZexGamePad APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'EOF_0'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "ZexGamePad"
+          include(":app")
+          EOF_0
+          cat > build.gradle.kts <<'EOF_1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_1
+          cat > gradle.properties <<'EOF_2'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF_2
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_3'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.mypad"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.mypad"
+                  minSdk = 28
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF_3
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+              <application
+                  android:label="ZexGamePad"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="sensorLandscape">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_4
+          mkdir -p app/src/main/java/com/example/mypad
+          cat > app/src/main/java/com/example/mypad/MainActivity.kt <<'EOF_5'
+          package com.example.mypad
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.bluetooth.BluetoothAdapter
+          import android.bluetooth.BluetoothDevice
+          import android.bluetooth.BluetoothHidDevice
+          import android.bluetooth.BluetoothHidDeviceAppSdpSettings
+          import android.bluetooth.BluetoothManager
+          import android.bluetooth.BluetoothProfile
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.widget.Button
+          import android.widget.GridLayout
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          @SuppressLint("MissingPermission", "ClickableViewAccessibility")
+          class MainActivity : Activity() {
+
+              private var hid: BluetoothHidDevice? = null
+              private var host: BluetoothDevice? = null
+              private var adapter: BluetoothAdapter? = null
+              private var buttons = 0
+              private var up = false
+              private var down = false
+              private var left = false
+              private var right = false
+              private lateinit var status: TextView
+              private lateinit var deviceBox: LinearLayout
+
+              // Standard HID gamepad: 16 buttons, 1 hat switch, 4 axes. Report ID 1, 7 bytes.
+              private val descriptor: ByteArray = intArrayOf(
+                  0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01,
+                  0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x10, 0x81, 0x02,
+                  0x05, 0x01, 0x09, 0x39, 0x15, 0x01, 0x25, 0x08, 0x35, 0x00, 0x46, 0x3B, 0x01, 0x65, 0x14,
+                  0x75, 0x04, 0x95, 0x01, 0x81, 0x42,
+                  0x65, 0x00, 0x75, 0x04, 0x95, 0x01, 0x81, 0x03,
+                  0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35,
+                  0x15, 0x81, 0x25, 0x7F, 0x35, 0x00, 0x45, 0x00, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02,
+                  0xC0
+              ).map { it.toByte() }.toByteArray()
+
+              private val callback = object : BluetoothHidDevice.Callback() {
+                  override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
+                      runOnUiThread {
+                          if (registered) {
+                              status.text = "Ready. On the TV: Add accessory, then pick this phone."
+                              makeDiscoverable()
+                              showPaired()
+                          } else {
+                              status.text = "Not registered"
+                          }
+                      }
+                  }
+
+                  override fun onConnectionStateChanged(device: BluetoothDevice?, state: Int) {
+                      runOnUiThread {
+                          if (state == BluetoothProfile.STATE_CONNECTED) {
+                              host = device
+                              status.text = "Connected to " + (device?.name ?: "device")
+                          } else if (state == BluetoothProfile.STATE_DISCONNECTED && device == host) {
+                              host = null
+                              status.text = "Disconnected. Pick the TV below to reconnect."
+                          }
+                      }
+                  }
+              }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  adapter = (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(Color.parseColor("#0f1220"))
+                  root.setPadding(dp(16), dp(8), dp(16), dp(8))
+
+                  val top = LinearLayout(this)
+                  top.orientation = LinearLayout.HORIZONTAL
+                  top.gravity = Gravity.CENTER_VERTICAL
+                  status = TextView(this)
+                  status.text = "Tap Start, then pair from your TV"
+                  status.setTextColor(Color.WHITE)
+                  status.textSize = 14f
+                  top.addView(status, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  val startBtn = Button(this)
+                  startBtn.text = "Start"
+                  startBtn.setOnClickListener { begin() }
+                  top.addView(startBtn)
+                  root.addView(top)
+
+                  deviceBox = LinearLayout(this)
+                  deviceBox.orientation = LinearLayout.HORIZONTAL
+                  root.addView(deviceBox)
+
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  row.gravity = Gravity.CENTER
+                  val dpad = GridLayout(this)
+                  dpad.columnCount = 3
+                  dpad.rowCount = 3
+                  addCell(dpad, pad("▲", "#2c3354", false) { up = it; send() }, 0, 1)
+                  addCell(dpad, pad("◀", "#2c3354", false) { left = it; send() }, 1, 0)
+                  addCell(dpad, pad("▶", "#2c3354", false) { right = it; send() }, 1, 2)
+                  addCell(dpad, pad("▼", "#2c3354", false) { down = it; send() }, 2, 1)
+                  row.addView(dpad)
+
+                  row.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+
+                  val mid = LinearLayout(this)
+                  mid.orientation = LinearLayout.VERTICAL
+                  mid.gravity = Gravity.CENTER
+                  val shoulders = LinearLayout(this)
+                  shoulders.addView(wide("L1", 4))
+                  shoulders.addView(wide("R1", 5))
+                  val menu = LinearLayout(this)
+                  menu.addView(wide("Select", 6))
+                  menu.addView(wide("Start", 7))
+                  mid.addView(shoulders)
+                  mid.addView(menu)
+                  row.addView(mid)
+
+                  row.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+
+                  val face = GridLayout(this)
+                  face.columnCount = 3
+                  face.rowCount = 3
+                  addCell(face, bit("Y", "#4ade80", 3), 0, 1)
+                  addCell(face, bit("X", "#6c8cff", 2), 1, 0)
+                  addCell(face, bit("B", "#ffd166", 1), 1, 2)
+                  addCell(face, bit("A", "#ff5d73", 0), 2, 1)
+                  row.addView(face)
+
+                  root.addView(row, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+                  setContentView(root)
+              }
+
+              private fun addCell(g: GridLayout, v: View, r: Int, c: Int) {
+                  val lp = GridLayout.LayoutParams(GridLayout.spec(r), GridLayout.spec(c))
+                  lp.width = dp(58)
+                  lp.height = dp(58)
+                  lp.setMargins(dp(3), dp(3), dp(3), dp(3))
+                  g.addView(v, lp)
+              }
+
+              private fun pad(label: String, color: String, round: Boolean, onChange: (Boolean) -> Unit): Button {
+                  val b = Button(this)
+                  b.text = label
+                  b.setTextColor(Color.WHITE)
+                  b.textSize = 16f
+                  val bg = GradientDrawable()
+                  bg.setColor(Color.parseColor(color))
+                  bg.cornerRadius = dp(if (round) 40 else 14).toFloat()
+                  b.background = bg
+                  b.setOnTouchListener { v, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> { v.alpha = 0.6f; onChange(true) }
+                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { v.alpha = 1f; onChange(false) }
+                      }
+                      true
+                  }
+                  return b
+              }
+
+              private fun bit(label: String, color: String, n: Int): Button =
+                  pad(label, color, true) { setBit(n, it) }
+
+              private fun wide(label: String, n: Int): Button {
+                  val b = pad(label, "#2c3354", false) { setBit(n, it) }
+                  b.layoutParams = LinearLayout.LayoutParams(dp(80), dp(46)).also { it.setMargins(dp(4), dp(4), dp(4), dp(4)) }
+                  return b
+              }
+
+              private fun setBit(n: Int, on: Boolean) {
+                  buttons = if (on) buttons or (1 shl n) else buttons and (1 shl n).inv()
+                  send()
+              }
+
+              private fun send() {
+                  val h = hid ?: return
+                  val d = host ?: return
+                  val hat = when {
+                      up && right -> 2
+                      right && down -> 4
+                      down && left -> 6
+                      left && up -> 8
+                      up -> 1
+                      right -> 3
+                      down -> 5
+                      left -> 7
+                      else -> 0
+                  }
+                  val r = byteArrayOf(
+                      (buttons and 0xFF).toByte(), ((buttons shr 8) and 0xFF).toByte(),
+                      hat.toByte(), 0, 0, 0, 0
+                  )
+                  h.sendReport(d, 1, r)
+              }
+
+              private fun begin() {
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      val need = arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE)
+                          .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+                      if (need.isNotEmpty()) {
+                          requestPermissions(need.toTypedArray(), 1)
+                          return
+                      }
+                  }
+                  startHid()
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+                      startHid()
+                  } else {
+                      status.text = "Bluetooth permission is needed"
+                  }
+              }
+
+              private fun startHid() {
+                  val a = adapter
+                  if (a == null || !a.isEnabled) {
+                      status.text = "Turn on Bluetooth first"
+                      return
+                  }
+                  status.text = "Starting..."
+                  a.getProfileProxy(this, object : BluetoothProfile.ServiceListener {
+                      override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+                          if (profile == BluetoothProfile.HID_DEVICE) {
+                              val h = proxy as BluetoothHidDevice
+                              hid = h
+                              val sdp = BluetoothHidDeviceAppSdpSettings(
+                                  "ZexGamePad", "Gamepad", "Zex",
+                                  BluetoothHidDevice.SUBCLASS2_GAMEPAD, descriptor
+                              )
+                              h.registerApp(sdp, null, null, mainExecutor, callback)
+                          }
+                      }
+
+                      override fun onServiceDisconnected(profile: Int) {
+                          hid = null
+                      }
+                  }, BluetoothProfile.HID_DEVICE)
+              }
+
+              private fun makeDiscoverable() {
+                  val i = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
+                  i.putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300)
+                  startActivity(i)
+              }
+
+              private fun showPaired() {
+                  deviceBox.removeAllViews()
+                  val list = adapter?.bondedDevices ?: return
+                  for (d in list) {
+                      val b = Button(this)
+                      b.text = "Connect: " + d.name
+                      b.textSize = 11f
+                      b.setOnClickListener { hid?.connect(d) }
+                      deviceBox.addView(b)
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  hid?.unregisterApp()
+              }
+          }
+          EOF_5
+          ls -R .
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZexGamePad-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
