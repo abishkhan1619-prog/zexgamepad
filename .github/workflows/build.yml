@@ -229,7 +229,7 @@ jobs:
                       if (type == BluetoothHidDevice.REPORT_TYPE_INPUT) {
                           hid?.replyReport(d, type, id, buildReport())
                       } else {
-                          hid?.reportError(d, BluetoothHidDevice.ERROR_RSP_UNSUPPORTED_REQUEST)
+                          hid?.reportError(d, BluetoothHidDevice.ERROR_RSP_UNSUPPORTED_REQ)
                       }
                   }
 
