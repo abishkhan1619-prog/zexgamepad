@@ -98,17 +98,24 @@ jobs:
      import android.app.Activity
      import android.bluetooth.BluetoothAdapter
      import android.bluetooth.BluetoothDevice
-     import android.bluetooth.BluetoothHidDevice
-     import android.bluetooth.BluetoothHidDeviceAppSdpSettings
+     import android.bluetooth.BluetoothGatt
+     import android.bluetooth.BluetoothGattCharacteristic
+     import android.bluetooth.BluetoothGattDescriptor
+     import android.bluetooth.BluetoothGattServer
+     import android.bluetooth.BluetoothGattServerCallback
+     import android.bluetooth.BluetoothGattService
      import android.bluetooth.BluetoothManager
      import android.bluetooth.BluetoothProfile
-     import android.content.Intent
+     import android.bluetooth.le.AdvertiseCallback
+     import android.bluetooth.le.AdvertiseData
+     import android.bluetooth.le.AdvertiseSettings
      import android.content.pm.PackageManager
      import android.graphics.Color
      import android.graphics.drawable.GradientDrawable
      import android.os.Build
      import android.os.Bundle
      import android.os.Handler
+     import android.os.ParcelUuid
      import android.view.Gravity
      import android.view.MotionEvent
      import android.view.View
@@ -117,23 +124,31 @@ jobs:
      import android.widget.HorizontalScrollView
      import android.widget.LinearLayout
      import android.widget.TextView
+     import java.util.UUID
      @SuppressLint("MissingPermission", "ClickableViewAccessibility")
      class MainActivity : Activity() {
-      private var hid: BluetoothHidDevice? = null
-      private var host: BluetoothDevice? = null
+      private var manager: BluetoothManager? = null
       private var adapter: BluetoothAdapter? = null
-      private var registered = false
+      private var server: BluetoothGattServer? = null
+      private var host: BluetoothDevice? = null
+      private var reportChar: BluetoothGattCharacteristic? = null
+      private var notifyOn = false
       private var buttons = 0
       private var up = false
       private var down = false
       private var left = false
       private var right = false
-      private var lastSendOk = true
-      private var discoverableAsked = false
+      private var mode = 0
+      private var originalName: String? = null
+      private val modeNames = arrayOf("Xbox Wireless Controller", "DualSense Wireless Controller", "Gamepad")
+      private val modeVid = intArrayOf(0x045E, 0x054C, 0x18D1)
+      private val modePid = intArrayOf(0x02FD, 0x0CE6, 0x0001)
       private lateinit var status: TextView
       private lateinit var logView: TextView
       private lateinit var deviceBox: LinearLayout
       private val logLines = ArrayList<String>()
+      private val pending = ArrayList<BluetoothGattService>()
+      private val readable = HashMap<UUID, ByteArray>()
       private val descriptor: ByteArray = intArrayOf(
        0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01,
        0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x10, 0x81, 0x02,
@@ -144,21 +159,16 @@ jobs:
        0x15, 0x81, 0x25, 0x7F, 0x35, 0x00, 0x45, 0x00, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02,
        0xC0
       ).map { it.toByte() }.toByteArray()
+      private fun u(s: Int): UUID = UUID.fromString(String.format("0000%04x-0000-1000-8000-00805f9b34fb", s))
       private fun log(s: String) {
        runOnUiThread {
         logLines.add(s)
-        while (logLines.size > 6) logLines.removeAt(0)
+        while (logLines.size > 4) logLines.removeAt(0)
         logView.text = logLines.joinToString("\n")
        }
       }
       private fun setStatus(s: String) {
        runOnUiThread { status.text = s }
-      }
-      private fun stateName(s: Int): String = when (s) {
-       BluetoothProfile.STATE_CONNECTED -> "CONNECTED"
-       BluetoothProfile.STATE_CONNECTING -> "CONNECTING"
-       BluetoothProfile.STATE_DISCONNECTING -> "DISCONNECTING"
-       else -> "DISCONNECTED"
       }
       private fun devName(d: BluetoothDevice?): String = d?.name ?: d?.address ?: "unknown"
       private fun buildReport(): ByteArray {
@@ -178,64 +188,189 @@ jobs:
         hat.toByte(), 0, 0, 0, 0
        )
       }
-      private val callback = object : BluetoothHidDevice.Callback() {
-       override fun onSetProtocol(device: BluetoothDevice?, protocol: Byte) {
-        log("TV SET_PROTOCOL " + protocol)
+      private fun fillReadable() {
+       val vid = modeVid[mode]
+       val pid = modePid[mode]
+       readable[u(0x2A29)] = "Zex".toByteArray()
+       readable[u(0x2A50)] = byteArrayOf(
+        0x02, (vid and 0xFF).toByte(), ((vid shr 8) and 0xFF).toByte(),
+        (pid and 0xFF).toByte(), ((pid shr 8) and 0xFF).toByte(), 0x00, 0x01
+       )
+       readable[u(0x2A19)] = byteArrayOf(100)
+       readable[u(0x2A4A)] = byteArrayOf(0x11, 0x01, 0x00, 0x02)
+       readable[u(0x2A4B)] = descriptor
+       readable[u(0x2A4E)] = byteArrayOf(1)
+      }
+      private fun chr(id: Int, props: Int, perms: Int): BluetoothGattCharacteristic =
+       BluetoothGattCharacteristic(u(id), props, perms)
+      private fun makeServices(): List<BluetoothGattService> {
+       val rd = BluetoothGattCharacteristic.PROPERTY_READ
+       val pr = BluetoothGattCharacteristic.PERMISSION_READ
+       val enc = BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED
+       val prim = BluetoothGattService.SERVICE_TYPE_PRIMARY
+       val dis = BluetoothGattService(u(0x180A), prim)
+       dis.addCharacteristic(chr(0x2A29, rd, pr))
+       dis.addCharacteristic(chr(0x2A50, rd, pr))
+       val bas = BluetoothGattService(u(0x180F), prim)
+       bas.addCharacteristic(chr(0x2A19, rd, pr))
+       val hidS = BluetoothGattService(u(0x1812), prim)
+       hidS.addCharacteristic(chr(0x2A4A, rd, enc))
+       hidS.addCharacteristic(chr(0x2A4B, rd, enc))
+       hidS.addCharacteristic(
+        chr(0x2A4C, BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE, BluetoothGattCharacteristic.PERMISSION_WRITE)
+       )
+       hidS.addCharacteristic(
+        chr(
+         0x2A4E, rd or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
+         pr or BluetoothGattCharacteristic.PERMISSION_WRITE
+        )
+       )
+       val rep = chr(0x2A4D, rd or BluetoothGattCharacteristic.PROPERTY_NOTIFY, enc)
+       rep.addDescriptor(
+        BluetoothGattDescriptor(
+         u(0x2902),
+         BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED or BluetoothGattDescriptor.PERMISSION_WRITE_ENCRYPTED
+        )
+       )
+       rep.addDescriptor(BluetoothGattDescriptor(u(0x2908), BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED))
+       hidS.addCharacteristic(rep)
+       reportChar = rep
+       return listOf(dis, bas, hidS)
+      }
+      private fun answer(d: BluetoothDevice, requestId: Int, offset: Int, v: ByteArray) {
+       if (offset > v.size) {
+        server?.sendResponse(d, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null)
+       } else {
+        server?.sendResponse(d, requestId, BluetoothGatt.GATT_SUCCESS, offset, v.copyOfRange(offset, v.size))
        }
-       override fun onVirtualCableUnplug(device: BluetoothDevice?) {
-        log("TV sent VIRTUAL_CABLE_UNPLUG")
-       }
-       override fun onInterruptData(device: BluetoothDevice?, reportId: Byte, data: ByteArray?) {
-        log("TV sent data id=" + reportId)
-       }
-       override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
-        this@MainActivity.registered = registered
-        log("HID registered = " + registered + ", plugged = " + devName(pluggedDevice))
-        runOnUiThread {
-         if (registered) {
-          status.text = "Ready. On the TV: Add accessory, or tap the TV name below."
-          if (!discoverableAsked) {
-           discoverableAsked = true
-           makeDiscoverable()
-          }
-          showPaired()
-         } else {
-          status.text = "Not registered. Tap Reset."         }
-        }
-       }
-       override fun onConnectionStateChanged(device: BluetoothDevice?, state: Int) {
-        log(devName(device) + ": " + stateName(state))
-        runOnUiThread {
-         if (state == BluetoothProfile.STATE_CONNECTED) {
-          host = device
-          status.text = "Connected to " + devName(device)
-         } else if (state == BluetoothProfile.STATE_CONNECTING) {
-          status.text = "Connecting to " + devName(device) + "..."
-         } else if (state == BluetoothProfile.STATE_DISCONNECTED) {
-          if (device == host) host = null
-          status.text = "Disconnected from " + devName(device)
-         }
-        }
-       }
-       override fun onGetReport(device: BluetoothDevice?, type: Byte, id: Byte, bufferSize: Int) {
-        val d = device ?: return
-        log("TV asked GET_REPORT type=" + type + " id=" + id)
-        if (type == BluetoothHidDevice.REPORT_TYPE_INPUT) {
-         hid?.replyReport(d, type, id, buildReport())
+      }
+      private val gattCb = object : BluetoothGattServerCallback() {
+       override fun onServiceAdded(status: Int, service: BluetoothGattService?) {
+        log("service added, status=" + status)
+        if (pending.isNotEmpty()) {
+         server?.addService(pending.removeAt(0))
         } else {
-         hid?.reportError(d, BluetoothHidDevice.ERROR_RSP_UNSUPPORTED_REQ)
+         startAdvertising()
         }
        }
-       override fun onSetReport(device: BluetoothDevice?, type: Byte, id: Byte, data: ByteArray?) {
-        val d = device ?: return
-        log("TV sent SET_REPORT")
-        hid?.reportError(d, BluetoothHidDevice.ERROR_RSP_SUCCESS)
+       override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
+        if (newState == BluetoothProfile.STATE_CONNECTED) {
+         host = device
+         log("TV connected: " + devName(device))
+         setStatus("Connected to " + devName(device) + " (waiting for TV)")
+        } else {
+         if (device == host) {
+          host = null
+          notifyOn = false
+         }
+         log("TV disconnected, status=" + status)
+         setStatus("Disconnected. Tap Connect below or pair again.")
+        }
        }
+       override fun onCharacteristicReadRequest(device: BluetoothDevice?, requestId: Int, offset: Int, characteristic: BluetoothGattCharacteristic?) {
+        val d = device ?: return
+        val c = characteristic ?: return
+        val v = if (c.uuid == u(0x2A4D)) buildReport() else (readable[c.uuid] ?: ByteArray(0))
+        log("TV read " + c.uuid.toString().substring(4, 8))
+        answer(d, requestId, offset, v)
+       }
+       override fun onDescriptorReadRequest(device: BluetoothDevice?, requestId: Int, offset: Int, descriptor: BluetoothGattDescriptor?) {
+        val d = device ?: return
+        val ds = descriptor ?: return
+        val v = if (ds.uuid == u(0x2908)) byteArrayOf(1, 1)
+        else if (notifyOn) byteArrayOf(1, 0) else byteArrayOf(0, 0)
+        answer(d, requestId, offset, v)
+       }
+       override fun onDescriptorWriteRequest(
+        device: BluetoothDevice?, requestId: Int, descriptor: BluetoothGattDescriptor?,
+        preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray?
+       ) {
+        val d = device ?: return
+        if (descriptor != null && descriptor.uuid == u(0x2902)) {
+         notifyOn = value != null && value.isNotEmpty() && value[0].toInt() == 1
+         log("TV notifications = " + notifyOn)
+         if (notifyOn) setStatus("Connected to " + devName(d) + " - READY")
+        }
+        if (responseNeeded) server?.sendResponse(d, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
+       }
+       override fun onCharacteristicWriteRequest(
+        device: BluetoothDevice?, requestId: Int, characteristic: BluetoothGattCharacteristic?,
+        preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray?
+       ) {
+        val d = device ?: return
+        log("TV wrote " + (characteristic?.uuid?.toString()?.substring(4, 8) ?: "?"))
+        if (responseNeeded) server?.sendResponse(d, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
+       }
+      }
+      private val advCb = object : AdvertiseCallback() {
+       override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+        log("Advertising started")
+        setStatus("Visible. On the TV: Add accessory, pick this phone.")
+       }
+       override fun onStartFailure(errorCode: Int) {
+        log("Advertising failed, code " + errorCode)
+        setStatus("Advertising failed (" + errorCode + ")")
+       }
+      }
+      private fun startAdvertising() {
+       val adv = adapter?.bluetoothLeAdvertiser
+       if (adv == null) {
+        log("No BLE advertiser")
+        return
+       }
+       val settings = AdvertiseSettings.Builder()
+        .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+        .setConnectable(true)
+        .setTimeout(0)
+        .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
+        .build()
+       val data = AdvertiseData.Builder()
+        .setIncludeDeviceName(false)
+        .addServiceUuid(ParcelUuid(u(0x1812)))
+        .build()
+       val scan = AdvertiseData.Builder().setIncludeDeviceName(true).build()
+       adv.startAdvertising(settings, data, scan, advCb)
+      }
+      private fun stopBle() {
+       try {
+        adapter?.bluetoothLeAdvertiser?.stopAdvertising(advCb)
+       } catch (e: Exception) {
+       }
+       server?.close()
+       server = null
+       host = null
+       notifyOn = false
+       pending.clear()
+      }
+      private fun startBle() {
+       val a = adapter
+       if (a == null || !a.isEnabled) {
+        setStatus("Turn on Bluetooth first")
+        return
+       }
+       if (a.bluetoothLeAdvertiser == null) {
+        setStatus("This phone cannot advertise BLE")
+        return
+       }
+       stopBle()
+       fillReadable()
+       val s = manager?.openGattServer(this, gattCb)
+       if (s == null) {
+        log("openGattServer failed")
+        return
+       }
+       server = s
+       pending.addAll(makeServices())
+       setStatus("Starting BLE...")
+       s.addService(pending.removeAt(0))
+       showPaired()
       }
       private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
       override fun onCreate(savedInstanceState: Bundle?) {
        super.onCreate(savedInstanceState)
-       adapter = (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter
+       manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
+       adapter = manager?.adapter
+       fillReadable()
        val root = LinearLayout(this)
        root.orientation = LinearLayout.VERTICAL
        root.setBackgroundColor(Color.parseColor("#0f1220"))
@@ -244,7 +379,7 @@ jobs:
        top.orientation = LinearLayout.HORIZONTAL
        top.gravity = Gravity.CENTER_VERTICAL
        status = TextView(this)
-       status.text = "Tap Start, then connect to your TV"
+       status.text = "Tap Start, then Add accessory on the TV"
        status.setTextColor(Color.WHITE)
        status.textSize = 13f
        top.addView(status, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -254,13 +389,33 @@ jobs:
        top.addView(startBtn)
        val resetBtn = Button(this)
        resetBtn.text = "Reset"
-       resetBtn.setOnClickListener { resetHid() }
+       resetBtn.setOnClickListener {
+        stopBle()
+        log("Reset")
+        Handler(mainLooper).postDelayed({ begin() }, 800)
+       }
        top.addView(resetBtn)
        root.addView(top)
        val scroll = HorizontalScrollView(this)
+       val bar = LinearLayout(this)
+       bar.orientation = LinearLayout.HORIZONTAL
+       val tags = arrayOf("Xbox", "PS5", "Other")
+       for (i in 0..2) {
+        val mb = Button(this)
+        mb.text = tags[i]
+        mb.textSize = 11f
+        mb.setOnClickListener {
+         mode = i
+         log("Mode: " + tags[i])
+         stopBle()
+         Handler(mainLooper).postDelayed({ begin() }, 800)
+        }
+        bar.addView(mb)
+       }
        deviceBox = LinearLayout(this)
        deviceBox.orientation = LinearLayout.HORIZONTAL
-       scroll.addView(deviceBox)
+       bar.addView(deviceBox)
+       scroll.addView(bar)
        root.addView(scroll)
        logView = TextView(this)
        logView.setTextColor(Color.parseColor("#9aa3c7"))
@@ -282,21 +437,25 @@ jobs:
        val mid = LinearLayout(this)
        mid.orientation = LinearLayout.VERTICAL
        mid.gravity = Gravity.CENTER
-       val shoulders = LinearLayout(this)
-       shoulders.addView(wide("L1", 4))
-       shoulders.addView(wide("R1", 5))
-       val menu = LinearLayout(this)
-       menu.addView(wide("Select", 6))
-       menu.addView(wide("Start", 7))
-       mid.addView(shoulders)
-       mid.addView(menu)
+       val r1 = LinearLayout(this)
+       r1.addView(wide("L1", 6))
+       r1.addView(wide("R1", 7))
+       val r2 = LinearLayout(this)
+       r2.addView(wide("L2", 8))
+       r2.addView(wide("R2", 9))
+       val r3 = LinearLayout(this)
+       r3.addView(wide("Select", 10))
+       r3.addView(wide("Start", 11))
+       mid.addView(r1)
+       mid.addView(r2)
+       mid.addView(r3)
        row.addView(mid)
        row.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
        val face = GridLayout(this)
        face.columnCount = 3
        face.rowCount = 3
-       addCell(face, bit("Y", "#4ade80", 3), 0, 1)
-       addCell(face, bit("X", "#6c8cff", 2), 1, 0)
+       addCell(face, bit("Y", "#4ade80", 4), 0, 1)
+       addCell(face, bit("X", "#6c8cff", 3), 1, 0)
        addCell(face, bit("B", "#ffd166", 1), 1, 2)
        addCell(face, bit("A", "#ff5d73", 0), 2, 1)
        row.addView(face)
@@ -332,7 +491,7 @@ jobs:
        pad(label, color, true) { setBit(n, it) }
       private fun wide(label: String, n: Int): Button {
        val b = pad(label, "#2c3354", false) { setBit(n, it) }
-       b.layoutParams = LinearLayout.LayoutParams(dp(80), dp(44)).also { it.setMargins(dp(4), dp(3), dp(4), dp(3)) }
+       b.layoutParams = LinearLayout.LayoutParams(dp(80), dp(38)).also { it.setMargins(dp(4), dp(2), dp(4), dp(2)) }
        return b
       }
       private fun setBit(n: Int, on: Boolean) {
@@ -340,13 +499,12 @@ jobs:
        send()
       }
       private fun send() {
-       val h = hid ?: return
        val d = host ?: return
-       val ok = h.sendReport(d, 1, buildReport())
-       if (ok != lastSendOk) {
-        lastSendOk = ok
-        log("sendReport " + (if (ok) "OK again" else "FAILED"))
-       }
+       val c = reportChar ?: return
+       val s = server ?: return
+       if (!notifyOn) return
+       c.value = buildReport()
+       s.notifyCharacteristicChanged(d, c, false)
       }
       private fun begin() {
        if (Build.VERSION.SDK_INT >= 31) {
@@ -357,91 +515,35 @@ jobs:
          return
         }
        }
-       startHid()
+       startBle()
       }
       override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
        if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
-        startHid()
+        startBle()
        } else {
         setStatus("Bluetooth permission is needed")
        }
       }
-      private fun startHid() {
-       val a = adapter
-       if (a == null || !a.isEnabled) {
-        setStatus("Turn on Bluetooth first")
-        return
-       }
-       if (hid != null) {
-        log("Already started. Use Reset if stuck.")
-        showPaired()
-        return
-       }
-       setStatus("Starting...")
-       a.getProfileProxy(this, object : BluetoothProfile.ServiceListener {
-        override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
-         if (profile == BluetoothProfile.HID_DEVICE) {
-          hid = proxy as BluetoothHidDevice
-          log("HID service connected")
-          registerNow()
-         }
-        }
-        override fun onServiceDisconnected(profile: Int) {
-         hid = null
-         registered = false
-         log("HID service lost")
-        }
-       }, BluetoothProfile.HID_DEVICE)
-      }
-      private fun registerNow() {
-       val h = hid ?: return
-       val sdp = BluetoothHidDeviceAppSdpSettings(
-        "ZexGamePad", "Gamepad", "Zex",
-        BluetoothHidDevice.SUBCLASS2_GAMEPAD, descriptor
-       )
-       val ok = h.registerApp(sdp, null, null, mainExecutor, callback)
-       log("registerApp request -> " + ok)
-      }
-      private fun resetHid() {
-       host = null
-       val h = hid
-       if (h == null) {
-        begin()
-        return
-       }
-       log("Reset: unregister")
-       h.unregisterApp()
-       Handler(mainLooper).postDelayed({ registerNow() }, 800)
-      }
-      private fun makeDiscoverable() {
-       val i = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
-       i.putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300)
-       startActivity(i)
-      }
       private fun showPaired() {
-       deviceBox.removeAllViews()
-       val list = adapter?.bondedDevices ?: return
-       for (d in list) {
-        val b = Button(this)
-        b.text = "Connect: " + devName(d)
-        b.textSize = 11f
-        b.setOnClickListener {
-         val h = hid
-         if (h == null || !registered) {
-          log("Press Start first (HID not registered)")
-         } else {
-          log("connect(" + devName(d) + ")...")
-          val ok = h.connect(d)
-          log("connect() returned " + ok)
+       runOnUiThread {
+        deviceBox.removeAllViews()
+        val list = adapter?.bondedDevices ?: return@runOnUiThread
+        for (d in list) {
+         val b = Button(this)
+         b.text = "Connect: " + devName(d)
+         b.textSize = 11f
+         b.setOnClickListener {
+          val ok = server?.connect(d, false)
+          log("connect(" + devName(d) + ") -> " + ok)
          }
+         deviceBox.addView(b)
         }
-        deviceBox.addView(b)
        }
       }
       override fun onDestroy() {
        super.onDestroy()
-       hid?.unregisterApp()
+       stopBle()
       }
      }
      EOF_5
@@ -451,3 +553,4 @@ jobs:
     with:
      name: ZexGamePad-APK
      path: app/build/outputs/apk/debug/app-debug.apk
+      
